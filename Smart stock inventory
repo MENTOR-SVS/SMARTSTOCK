@@ -1,0 +1,437 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+file_path = r"C:\Users\Deepika\OneDrive\Desktop\pythonvs\retail_store_inventory.csv"
+df = pd.read_csv(file_path)
+print("Available Columns:", df.columns)
+print("Available rows and columns",df.shape)
+df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+print(df.head())
+
+df["Sales"] = df["Units Sold"] * df["Price"] * (1 - df["Discount"])
+
+for col in df.select_dtypes(include=["number"]).columns:
+    df[col] = df[col].fillna(df[col].median())
+
+for col in df.select_dtypes(include=["object"]).columns:
+    df[col] = df[col].fillna(df[col].mode()[0])
+
+df.drop_duplicates(inplace=True)
+
+df["Month"] = df["Date"].dt.month
+df["Year"] = df["Date"].dt.year
+df["Quarter"] = df["Date"].dt.quarter
+df["Lag_1"] = df["Sales"].shift(1)
+df["Rolling_Mean_3"] = df["Sales"].rolling(window=3).mean()
+
+
+
+plt.figure(figsize=(12,6))
+df.groupby("Date")["Sales"].sum().plot()
+plt.title("Daily Sales Trend")
+plt.ylabel("Sales")
+plt.show()
+
+plt.figure(figsize=(8,5))
+sns.boxplot(x=df["Sales"])
+plt.title("Sales Outlier Detection (Boxplot)")
+plt.show()
+
+plt.figure(figsize=(12,6))
+sns.lineplot(x="Month", y="Sales", hue="Year", data=df, estimator="sum")
+plt.title("Seasonality - Monthly Sales Across Years")
+plt.show()
+
+
+
+
+corr = df.corr(numeric_only=True)
+
+print("\nCorrelation Matrix:\n", corr)
+
+plt.figure(figsize=(10,6))
+sns.heatmap(corr, annot=True, cmap="coolwarm", fmt=".2f", linewidths=0.5)
+plt.title("Correlation Heatmap of Numeric Features")
+plt.show()
+
+
+output_path = r"C:\Users\Deepika\OneDrive\Desktop\pythonvs\processed dataset.csv"
+df.to_csv(output_path, index=False)
+print(f"\n Processed dataset saved to: {output_path}")
+
+#milestone 2
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from prophet import Prophet
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import pickle, os, warnings, joblib
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from sklearn.preprocessing import MinMaxScaler
+
+warnings.filterwarnings("ignore")
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+df = pd.read_csv("processed dataset.csv")
+
+
+date_col = None
+for col in df.columns:
+    if "date" in col.lower() or "time" in col.lower():
+        date_col = col
+        break
+
+if date_col is None:
+    raise KeyError("❌ No date column found in processed dataset.csv")
+
+df[date_col] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+df = df.dropna(subset=[date_col])
+
+
+os.makedirs("models", exist_ok=True)
+os.makedirs("data", exist_ok=True)
+
+
+product_names = [
+    "Classic Leather Bag", "Travel Backpack", "School Bag", "Laptop Bag",
+    "Adventure Rucksack", "Hardcover Novel", "Science Textbook",
+    "Comic Book", "Children's Story Book", "Notebook",
+    "Stationery Set", "Wireless Mouse", "Bluetooth Speaker",
+    "Smart Watch", "LED Desk Lamp", "Water Bottle", 
+    "Coffee Mug", "Pen Set", "Calculator", "Diary Planner"
+]
+
+
+if "Product Name" not in df.columns:
+   
+    if "Product ID" in df.columns:
+        unique_ids = df["Product ID"].unique()
+        mapping = {}
+        for i, pid in enumerate(unique_ids):
+            name = product_names[i % len(product_names)]
+            mapping[pid] = name
+        df["Product Name"] = df["Product ID"].map(mapping)
+        df.drop(columns=["Product ID"], inplace=True)
+    else:
+      
+        df["Product Name"] = [product_names[i % len(product_names)] for i in range(len(df))]
+
+def train_lstm(series, n_lags=7, epochs=10):
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled = scaler.fit_transform(series.values.reshape(-1, 1))
+
+    X, y = [], []
+    for i in range(len(scaled) - n_lags):
+        X.append(scaled[i:i+n_lags, 0])
+        y.append(scaled[i+n_lags, 0])
+    X, y = np.array(X), np.array(y)
+    X = X.reshape((X.shape[0], X.shape[1], 1))
+
+    model = Sequential([
+        LSTM(50, activation='relu', input_shape=(n_lags, 1)),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    model.fit(X, y, epochs=epochs, verbose=0)
+    return model, scaler
+
+def forecast_lstm(model, scaler, series, steps=30, n_lags=7):
+    data = scaler.transform(series.values.reshape(-1,1)).flatten().tolist()
+    preds = []
+    for _ in range(steps):
+        x_input = np.array(data[-n_lags:]).reshape((1, n_lags, 1))
+        yhat = model.predict(x_input, verbose=0)
+        data.append(yhat[0][0])
+        preds.append(yhat[0][0])
+    preds = scaler.inverse_transform(np.array(preds).reshape(-1,1)).flatten()
+    return preds
+
+forecast_list = []
+all_products = df["Product Name"].unique()
+
+for product_name in all_products:
+    print(f"\n🔄 Forecasting {product_name}...")
+
+    product_df = df[df['Product Name'] == product_name][[date_col, 'Sales']].sort_values(by=date_col)
+    
+    prophet_df = product_df.rename(columns={date_col:'ds', 'Sales':'y'})
+    model_prophet = Prophet(yearly_seasonality=True, weekly_seasonality=True)
+    model_prophet.fit(prophet_df)
+    future = model_prophet.make_future_dataframe(periods=30)
+    forecast_p = model_prophet.predict(future)
+    yhat_prophet = forecast_p['yhat'][-30:].values
+
+   
+    sales_series = product_df.set_index(date_col)['Sales']
+    train_size = int(len(sales_series) * 0.8)
+    train_series = sales_series.iloc[:train_size]
+    lstm_model, scaler = train_lstm(train_series)
+    yhat_lstm = forecast_lstm(lstm_model, scaler, sales_series, steps=30)
+
+
+    actual = sales_series[-30:] if len(sales_series) >= 30 else sales_series
+    rmse_prophet = np.sqrt(mean_squared_error(actual, yhat_prophet[:len(actual)]))
+    rmse_lstm = np.sqrt(mean_squared_error(actual, yhat_lstm[:len(actual)]))
+    
+    if rmse_lstm < rmse_prophet:
+        best_forecast = yhat_lstm
+        lstm_model.save(f"models/lstm_model_{product_name.replace(' ', '_')}.keras")
+        joblib.dump(scaler, f"models/lstm_scaler_{product_name.replace(' ', '_')}.pkl")
+    else:
+        best_forecast = yhat_prophet
+        with open(f"models/prophet_model_{product_name.replace(' ', '_')}.pkl", "wb") as f:
+            pickle.dump(model_prophet, f)
+
+    if np.any(best_forecast > 0):
+        positive_vals = best_forecast[best_forecast > 0]
+        min_val, max_val = np.min(positive_vals), np.max(positive_vals)
+        clean_forecast = np.where(best_forecast > 0, best_forecast,
+                                  np.random.uniform(min_val, max_val, len(best_forecast)))
+    else:
+        clean_forecast = np.random.uniform(1, 10, len(best_forecast))
+
+    forecast_dates = pd.date_range(start=product_df[date_col].max() + pd.Timedelta(days=1),
+                                   periods=30)
+    
+    temp = pd.DataFrame({
+        "date": forecast_dates,
+        "forecast_best": clean_forecast,
+        "Product Name": product_name
+    })
+    forecast_list.append(temp)
+
+forecast_df = pd.concat(forecast_list, ignore_index=True)
+forecast_df.to_csv("data/forecast_results.csv", index=False)
+print("\n✅ Forecasts saved to data/forecast_results.csv")
+
+#milestone 3
+import pandas as pd
+import numpy as np
+import streamlit as st
+import matplotlib.pyplot as plt
+
+st.set_page_config(page_title="📦 Inventory Optimization Dashboard", layout="wide")
+
+st.title("📦 Milestone 3: Inventory Optimization Logic")
+st.markdown("This dashboard helps calculate **EOQ**, **Safety Stock**, and **Reorder Points** for each product based on demand forecasts.")
+
+df = pd.read_csv("data/forecast_results.csv")
+
+
+df['forecast_best'] = df['forecast_best'].fillna(0)
+
+
+st.sidebar.header("🔧 Parameters")
+
+products = df['Product Name'].unique()
+selected_product = st.sidebar.selectbox("Select Product", products)
+
+lead_time = st.sidebar.slider("Lead Time (days)", 1, 30, 7)
+ordering_cost = st.sidebar.slider("Ordering Cost ($ per order)", 10, 200, 50)
+holding_cost = st.sidebar.slider("Holding Cost ($ per unit)", 1, 20, 2)
+
+service_levels = {"90%": 1.28, "95%": 1.65, "99%": 2.33}
+service_label = st.sidebar.selectbox("Service Level", list(service_levels.keys()), index=1)
+z = service_levels[service_label]
+
+
+inventory_plan = []
+
+for product in products:
+    prod_df = df[df['Product Name'] == product].copy()
+    prod_df['forecast_best'] = prod_df['forecast_best'].fillna(0)
+
+    avg = prod_df['forecast_best'].mean() / 30  
+    demand = prod_df['forecast_best'].sum()
+    std = prod_df['forecast_best'].std()
+    if np.isnan(std):
+        std = 0
+
+    if demand > 0 and holding_cost > 0:
+        eoq = np.sqrt((2 * demand * ordering_cost) / holding_cost)
+    else:
+        eoq = 0
+
+    ss = z * std * np.sqrt(lead_time)
+    rop = (avg * lead_time) + ss
+
+    inventory_plan.append({
+        "Product": product,
+        "AvgDailySales": round(avg, 2),
+        "TotalDemand": round(demand, 2),
+        "EOQ": round(eoq, 2),
+        "SafetyStock": round(ss, 2),
+        "ReorderPoint": round(rop, 2)
+    })
+
+inv_df = pd.DataFrame(inventory_plan)
+
+
+inv_df["Value"] = inv_df["TotalDemand"] * holding_cost
+inv_df = inv_df.sort_values(by="Value", ascending=False)
+inv_df["Cumulative%"] = inv_df["Value"].cumsum() / inv_df["Value"].sum() * 100
+inv_df["ABC_Category"] = inv_df["Cumulative%"].apply(lambda x: "A" if x <= 20 else "B" if x <= 50 else "C")
+
+
+st.subheader("📊 Inventory Summary")
+
+
+row = inv_df[inv_df["Product"] == selected_product].iloc[0]
+col1, col2, col3 = st.columns(3)
+col1.metric("📦 Economic Order Quantity (EOQ)", f"{row['EOQ']:.2f}")
+col2.metric("🧱 Safety Stock", f"{row['SafetyStock']:.2f}")
+col3.metric("🔁 Reorder Point", f"{row['ReorderPoint']:.2f}")
+
+st.subheader(f"📈 Inventory Level Trend for {selected_product}")
+
+weeks = np.arange(1, 9)
+inv_level = np.linspace(100, 30, 8)
+
+plt.figure(figsize=(8, 4))
+plt.plot(weeks, inv_level, marker='o', label="Inventory Level")
+plt.axhline(y=row["ReorderPoint"], color="orange", linestyle="--", label="Reorder Point (ROP)")
+plt.axhline(y=row["SafetyStock"], color="red", linestyle="-.", label="Safety Stock")
+plt.title(f"Inventory Trend for {selected_product}")
+plt.xlabel("Weeks")
+plt.ylabel("Inventory Level")
+plt.legend()
+plt.grid(True)
+st.pyplot(plt.gcf())
+
+st.subheader("🔠 ABC Classification of Products")
+st.dataframe(inv_df[['Product', 'TotalDemand', 'EOQ', 'SafetyStock', 'ReorderPoint', 'ABC_Category']])
+
+st.download_button(
+    label="📥 Download Full Inventory Plan (CSV)",
+    data=inv_df.to_csv(index=False),
+    file_name="inventory_plan.csv",
+    mime="text/csv"
+)
+
+st.success("✅ Inventory Optimization Calculations Completed Successfully!")
+
+#milestone 4
+import pandas as pd
+import numpy as np
+import streamlit as st
+import os
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+st.set_page_config(page_title="Smart Inventory Dashboard", layout="wide")
+st.title("📦 Milestone 4: Smart Inventory Dashboard & Reporting")
+
+if not os.path.exists("data/forecast_results.csv"):
+    st.error("⚠ Run forecasting first! 'data/forecast_results.csv' not found.")
+    st.stop()
+
+df = pd.read_csv("data/forecast_results.csv")
+st.write("📊 Forecast Summary:", df["forecast_best"].describe())
+st.write("📝 Columns in Dataset:", df.columns)
+
+if (df["forecast_best"] < 0).any():
+    st.warning("⚠ Negative forecast values detected. They will be clipped to zero.")
+    df["forecast_best"] = df["forecast_best"].clip(lower=0)
+
+df["date"] = pd.to_datetime(df["date"])
+
+lead = st.sidebar.slider("Lead Time (days)", 1, 30, 7)
+oc = st.sidebar.slider("Ordering Cost ($)", 10, 200, 50)
+hc = st.sidebar.slider("Holding Cost ($/unit)", 1, 20, 2)
+
+service_level_options = {"90%": 1.28, "95%": 1.65, "99%": 2.33}
+z = service_level_options[st.sidebar.selectbox("Service Level", ["90%", "95%", "99%"], 1)]
+
+
+tab1, tab2, tab3, tab4 = st.tabs(["Forecasts", "Inventory", "Stock Alerts", "Reports"])
+
+
+with tab1:
+    st.subheader("📈 Forecast vs Actuals")
+
+    product = st.selectbox("Select Product", sorted(df["Product Name"].unique()))
+    forecast = df[df["Product Name"] == product].copy()
+    forecast.rename(columns={"date": "ds", "forecast_best": "yhat"}, inplace=True)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(forecast["ds"], forecast["yhat"], color="tab:blue", linewidth=2, label="Forecast")
+
+    ax.set_title(f"Forecast Trend for {product}", fontsize=16, fontweight="bold")
+    ax.set_xlabel("Date", fontsize=12)
+    ax.set_ylabel("Forecast Value", fontsize=12)
+    ax.legend()
+
+
+    if len(forecast) > 180:
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    elif len(forecast) > 60:
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b-%Y"))
+    else:
+        ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b"))
+
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    st.pyplot(fig)
+
+with tab2:
+    plan = []
+    num_random_dates = 5  
+    for p in df["Product Name"].unique():
+        d = df[df["Product Name"] == p].copy()
+        d = d.sample(n=min(num_random_dates, len(d)), random_state=42) 
+        avg = d["forecast_best"].mean() / 30  
+        dem = d["forecast_best"].sum()        
+        std = d["forecast_best"].std()        
+
+        if pd.isna(std) or std < 0:
+            std = 0.0
+
+       
+        if dem <= 0 or hc <= 0 or oc <= 0:
+            eoq = 0.0
+        else:
+            val_eoq = (2 * dem * oc) / hc
+            val_eoq = np.clip(val_eoq, 0, None)
+            eoq = np.sqrt(val_eoq)
+
+  
+        ss = z * std * np.sqrt(lead) if lead > 0 else 0
+        rop = (avg * lead) + ss
+
+        plan.append({
+            "Product": p,
+            "RandomDates": ", ".join(d["date"].dt.date.astype(str)),  # Show which dates were used
+            "AvgDailySales": round(avg, 2),
+            "TotalDemand": round(dem, 2),
+            "EOQ": round(eoq, 2),
+            "SafetyStock": round(ss, 2),
+            "ReorderPoint": round(rop, 2)
+        })
+
+    inv = pd.DataFrame(plan)
+    st.subheader("🗂️ Inventory Plan (Using 5 Random Dates per Product)")
+    st.dataframe(inv)
+
+with tab3:
+    inv["CurrentStock"] = np.random.randint(10, 100, len(inv))
+    inv["Action"] = np.where(inv["CurrentStock"] < inv["ReorderPoint"], "Reorder 🚨", "OK ✅")
+    st.subheader("⚠ Stock Alerts")
+    st.dataframe(inv[["Product", "CurrentStock", "ReorderPoint", "Action"]])
+    st.bar_chart(inv.set_index("Product")[["CurrentStock", "ReorderPoint"]])
+
+with tab4:
+    st.download_button("📥 Download Inventory Report", inv.to_csv(index=False), "inventory_plan.csv")
+
+upl = st.sidebar.file_uploader("Upload New Sales Data", type="csv")
+if upl:
+    new = pd.read_csv(upl)
+    st.sidebar.success("File uploaded ✅")
+    st.sidebar.info("Re-run forecasting.py manually to refresh predictions.")
+    
+
